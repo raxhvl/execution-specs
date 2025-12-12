@@ -14,7 +14,7 @@ from typing import (
 )
 
 import pytest
-from pydantic import ConfigDict, Field, field_validator, model_serializer
+from pydantic import ConfigDict, Field, PrivateAttr, field_validator, model_serializer
 
 from execution_testing.base_types import (
     Address,
@@ -472,6 +472,9 @@ class BlockchainTest(BaseTest):
     verification is only performed based on the state root.
     """
 
+    _built_blocks: List[BuiltBlock] = PrivateAttr(default_factory=list)
+    """Internal storage for built blocks with execution results."""
+
     supported_fixture_formats: ClassVar[
         Sequence[FixtureFormat | LabeledFixtureFormat]
     ] = [
@@ -843,6 +846,7 @@ class BlockchainTest(BaseTest):
                 previous_alloc=alloc,
                 last_block=i == len(self.blocks) - 1,
             )
+            self._built_blocks.append(built_block)
             fixture_blocks.append(built_block.get_fixture_block())
 
             # BAL verification already done in to_fixture_bal() if
@@ -871,6 +875,7 @@ class BlockchainTest(BaseTest):
         info = {}
         if self._opcode_count is not None:
             info["opcode_count"] = self._opcode_count.model_dump()
+
         return BlockchainFixture(
             fork=self.fork,
             genesis=genesis.header,
@@ -923,6 +928,7 @@ class BlockchainTest(BaseTest):
                 previous_alloc=alloc,
                 last_block=i == len(self.blocks) - 1,
             )
+            self._built_blocks.append(built_block)
             fixture_payloads.append(
                 built_block.get_fixture_engine_new_payload()
             )
@@ -1005,6 +1011,7 @@ class BlockchainTest(BaseTest):
                 previous_alloc=alloc,
                 last_block=False,
             )
+            self._built_blocks.append(sync_built_block)
             fixture_data.update(
                 {
                     "sync_payload": sync_built_block.get_fixture_engine_new_payload(),
@@ -1026,6 +1033,28 @@ class BlockchainTest(BaseTest):
                 }
             )
             return BlockchainEngineFixture(**fixture_data)
+
+    def get_result(self) -> Dict[str, Any]:
+        """
+        Get execution results from the test.
+
+        Returns a dictionary containing:
+        - gas_used: List of dicts with {block_index, tx_index, gas_used} for each transaction
+        """
+        gas_used = []
+        tx_index = 0
+        for block_index, built_block in enumerate(self._built_blocks):
+            block_gas = int(built_block.result.gas_used)
+            gas_used.append({
+                "block_index": block_index,
+                "tx_index": tx_index,
+                "gas_used": block_gas,
+            })
+            tx_index += 1
+
+        return {
+            "gas_used": gas_used,
+        }
 
     def generate(
         self,

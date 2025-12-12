@@ -18,6 +18,9 @@ from enum import Enum
 from typing import Callable, Dict
 
 import pytest
+from rich.console import Console
+from rich.table import Table
+
 from execution_testing import (
     AccessList,
     Account,
@@ -46,6 +49,13 @@ REFERENCE_SPEC_VERSION = ref_spec_7928.version
 
 
 pytestmark = pytest.mark.valid_from("Amsterdam")
+
+
+# Global list to collect gas data for aggregate reporting
+_GAS_TRACKING_DATA: list = []
+
+# Global list for test_bal_delegatecall_no_delegation_and_oog_before_target_access
+_TEST_BAL_DELEGATECALL_NO_DELEGATION_GAS_DATA: list = []
 
 
 class OutOfGasAt(Enum):
@@ -86,6 +96,421 @@ class OutOfGasBoundary(Enum):
     OOG_AFTER_TARGET_ACCESS = "oog_after_target_access"
     OOG_SUCCESS_MINUS_1 = "oog_success_minus_1"
     SUCCESS = "success"
+
+
+def print_gas_breakdown(
+    test_name: str,
+    oog_boundary: OutOfGasBoundary,
+    target_is_warm: bool,
+    delegation_is_warm: bool,
+    value: int,
+    memory_expansion: bool,
+    ret_size: int,
+    message_gas: int,
+    intrinsic_cost: int,
+    bytecode_cost: int,
+    access_cost: int,
+    transfer_cost: int,
+    memory_cost: int,
+    delegation_cost: int,
+    static_gas_cost: int,
+    second_check_cost: int,
+    gas_limit: int,
+    target_in_bal: bool,
+    delegation_in_bal: bool,
+    value_transferred: bool,
+    result: dict,
+    enabled: bool = True,
+) -> None:
+    """Collect gas breakdown data for aggregate reporting."""
+    if not enabled:
+        return
+
+    # Calculate milestones
+    milestone1 = (
+        intrinsic_cost + bytecode_cost + static_gas_cost
+    )  # Gas to access target
+    milestone2 = (
+        intrinsic_cost + bytecode_cost + second_check_cost
+    )  # Gas to access delegation
+    gap1 = gas_limit - milestone1  # Gap to milestone 1
+    gap2 = gas_limit - milestone2  # Gap to milestone 2
+
+    # Get actual gas from execution result
+    gas_used = None
+    if result and "gas_used" in result and result["gas_used"]:
+        # Get gas from first transaction (block 0, tx 0)
+        gas_used = result["gas_used"][0]["gas_used"]
+
+    # Surplus = GasLimit - GasUsed (actual execution)
+    # Will be 0 (OOG) or positive (leftover gas)
+    surplus = (gas_limit - gas_used) if gas_used is not None else None
+
+    # Store data for aggregate reporting
+    _GAS_TRACKING_DATA.append(
+        {
+            "test_name": test_name,
+            "boundary": oog_boundary.value,
+            "target": "W" if target_is_warm else "C",
+            "delegation": "W" if delegation_is_warm else "C",
+            "value": value,
+            "mem_expansion": ret_size,
+            "intrinsic": intrinsic_cost,
+            "bytecode": bytecode_cost,
+            "access": access_cost,
+            "transfer": transfer_cost,
+            "mem_cost": memory_cost,
+            "deleg_cost": delegation_cost,
+            "msg_gas": message_gas,
+            "static": static_gas_cost,
+            "second": second_check_cost,
+            "milestone1": milestone1,
+            "milestone2": milestone2,
+            "gap1": gap1,
+            "gap2": gap2,
+            "gas_limit": gas_limit,
+            "gas_used": gas_used,
+            "surplus": surplus,
+            "tgt_bal": target_in_bal,
+            "del_bal": delegation_in_bal,
+            "xfer": value_transferred,
+        }
+    )
+
+
+def print_gas_table(
+    data: list,
+    columns: list[dict],
+    title: str,
+    legend: str | None = None,
+    enabled: bool = True,
+) -> None:
+    """
+    Generic gas table printer with configurable columns.
+
+    Args:
+        data: List of dicts containing row data
+        columns: List of column definitions, each with:
+            - header: Column header text
+            - key: Data key (str) or callable(row) -> value
+            - justify: "left", "right", or "center" (default: "left")
+            - width: Optional fixed width (default: auto)
+            - no_wrap: Boolean (default: True)
+            - style: Optional style string (default: None)
+            - color_fn: Optional callable(value, row) -> colored_str
+        title: Table title
+        legend: Optional legend text to print after table
+        enabled: Whether to print (default: True)
+    """
+    if not enabled or not data:
+        return
+
+    console = Console()
+    console.print(f"\n[bold cyan]{title}[/bold cyan]\n")
+
+    table = Table(show_lines=True, expand=True)
+
+    # Add row number column
+    table.add_column("#", justify="right", style="cyan", width=3, no_wrap=True)
+
+    # Add configured columns
+    for col in columns:
+        table.add_column(
+            col["header"],
+            justify=col.get("justify", "left"),
+            width=col.get("width"),
+            no_wrap=col.get("no_wrap", True),
+            style=col.get("style"),
+            overflow=col.get("overflow", "fold"),
+        )
+
+    # Add rows
+    for idx, row in enumerate(data, start=1):
+        row_values = [str(idx)]
+        for col in columns:
+            # Get value from row using key or callable
+            key = col["key"]
+            if callable(key):
+                value = key(row)
+            else:
+                value = row.get(key, "")
+
+            # Apply color function if provided
+            color_fn = col.get("color_fn")
+            if color_fn:
+                value_str = color_fn(value, row)
+            else:
+                value_str = str(value)
+
+            row_values.append(value_str)
+
+        table.add_row(*row_values)
+
+    console.print(table)
+
+    # Print legend if provided
+    if legend:
+        console.print(legend)
+
+
+def print_aggregate_gas_table() -> None:
+    """Print aggregate gas table for all collected test cases using rich."""
+    if not _GAS_TRACKING_DATA:
+        return
+
+    # Color coding function for gap columns (can be negative, zero, or positive)
+    def color_gap(value, row):
+        if value < 0:
+            return f"[red]{value}[/red]"
+        elif value == 0:
+            return f"[yellow]{value}[/yellow]"
+        else:
+            return f"[green]{value}[/green]"
+
+    # Color coding function for surplus (0 or positive only)
+    def color_surplus(value, row):
+        if value is None:
+            return "N/A"
+        elif value == 0:
+            return f"[yellow]{value}[/yellow]"
+        else:
+            return f"[green]{value}[/green]"
+
+    # Column definitions
+    columns = [
+        {"header": "Test Parameters", "key": "test_name", "style": "dim", "width": 40, "no_wrap": False},
+        {"header": "T", "key": "target", "justify": "center"},
+        {"header": "D", "key": "delegation", "justify": "center"},
+        {"header": "V", "key": "value", "justify": "center"},
+        {"header": "MemExp", "key": "mem_expansion", "justify": "right"},
+        {"header": "Intr (A)", "key": "intrinsic", "justify": "right"},
+        {"header": "Byte (B)", "key": "bytecode", "justify": "right"},
+        {"header": "TA (C)", "key": "access", "justify": "right"},
+        {"header": "xfer (D)", "key": "transfer", "justify": "right"},
+        {"header": "Mem (E)", "key": "mem_cost", "justify": "right"},
+        {"header": "Static (F)", "key": "static", "justify": "right"},
+        {"header": "M1", "key": "milestone1", "justify": "right"},
+        {"header": "DA (G)", "key": "deleg_cost", "justify": "right"},
+        {"header": "Second (H)", "key": "second", "justify": "right"},
+        {"header": "M2", "key": "milestone2", "justify": "right"},
+        {"header": "Msg (I)", "key": "msg_gas", "justify": "right"},
+        {"header": "G1", "key": "gap1", "justify": "right", "color_fn": color_gap},
+        {"header": "G2", "key": "gap2", "justify": "right", "color_fn": color_gap},
+        {"header": "GasLimit", "key": "gas_limit", "justify": "right"},
+        {"header": "GasUsed", "key": "gas_used", "justify": "right"},
+        {"header": "Surplus", "key": "surplus", "justify": "right", "color_fn": color_surplus},
+        {"header": "TgtBAL", "key": "tgt_bal", "justify": "center"},
+        {"header": "DelBAL", "key": "del_bal", "justify": "center"},
+        {"header": "ValXfer", "key": "xfer", "justify": "center"},
+    ]
+
+    # Legend
+    legend = """
+[bold cyan]═══ MILESTONE CONCEPT ═══[/bold cyan]
+EIP-7702 CALL execution has two key milestones:
+  [bold]M1 (Milestone 1)[/bold]: Gas needed to access target account
+     • If GasLim ≥ M1 → Target appears in BAL
+     • OOG_BEFORE_TARGET_ACCESS: G1 < 0
+     • OOG_AFTER_TARGET_ACCESS: G1 ≥ 0, G2 < 0
+  [bold]M2 (Milestone 2)[/bold]: Gas needed to access delegation
+     • If GasLim ≥ M2 → Delegation appears in BAL
+     • OOG_SUCCESS_MINUS_1: G2 = -1
+     • SUCCESS: G2 ≥ 0
+
+[bold]Legend:[/bold]
+  [bold]Column Codes:[/bold]
+    T/D/V/M: Target/Delegation warmness (W/C), Value (0/1), Memory (0/32)
+    A: Intr - Intrinsic gas cost (base tx + access list)
+    B: Byte - Bytecode cost (7 × PUSH for CALL params)
+
+  [bold]Static Cost → Milestone 1:[/bold]
+    C: TA - Target Access cost (cold=2600, warm=100)
+    D: xfer - Transfer cost (0 or 9000 if value > 0)
+    E: Mem - Memory expansion cost
+    → F: Static - Static gas cost [C + D + E]
+    → [cyan]M1: Milestone 1 [A + B + F] - Gas to access target[/cyan]
+
+  [bold]Second Check → Milestone 2:[/bold]
+    G: DA - Delegation Access cost (cold=2600, warm=100)
+    → H: Second - Second check cost [G + F]
+    → [cyan]M2: Milestone 2 [A + B + H] - Gas to access delegation[/cyan]
+    Note: M2 = M1 + G (since H = G + F)
+
+  [bold]Other Components:[/bold]
+    I: Msg - Message gas passed to CALL (checked separately by EVM)
+    GasLim: Transaction gas limit
+
+  [bold]Gap Analysis:[/bold]
+    [red]G1[/red]/[yellow]G1[/yellow]/[green]G1[/green] = GasLim - M1
+      • [red]G1 < 0[/red]: OOG before target access
+      • [yellow]G1 = 0[/yellow]: Exact boundary
+      • [green]G1 > 0[/green]: Target accessed successfully
+    [red]G2[/red]/[yellow]G2[/yellow]/[green]G2[/green] = GasLim - M2
+      • [red]G2 < 0[/red]: OOG before delegation access
+      • [yellow]G2 = 0[/yellow]: Exact boundary
+      • [green]G2 > 0[/green]: Delegation accessed successfully
+
+  [bold]Results:[/bold]
+    TgtBAL: Target account in BAL (True/False)
+    DelBAL: Delegation target in BAL (True/False)
+    ValXfer: Value actually transferred (True/False)
+"""
+
+    print_gas_table(
+        data=_GAS_TRACKING_DATA,
+        columns=columns,
+        title="AGGREGATE GAS BREAKDOWN - test_bal_call_7702_delegation_and_oog",
+        legend=legend,
+    )
+
+
+def print_delegatecall_no_delegation_gas_breakdown(
+    test_name: str,
+    oog_boundary: OutOfGasBoundary,
+    target_is_warm: bool,
+    memory_expansion: bool,
+    ret_size: int,
+    intrinsic_cost: int,
+    bytecode_cost: int,
+    access_cost: int,
+    memory_cost: int,
+    static_gas_cost: int,
+    gas_limit: int,
+    target_in_bal: bool,
+    result: dict,
+    enabled: bool = True,
+) -> None:
+    """Collect gas breakdown data for DELEGATECALL (no delegation) test."""
+    if not enabled:
+        return
+
+    # Calculate milestone (gas needed to reach target)
+    milestone = intrinsic_cost + bytecode_cost + static_gas_cost
+
+    # Get actual gas from execution result
+    gas_used = None
+    if result and "gas_used" in result and result["gas_used"]:
+        # Get gas from first transaction (block 0, tx 0)
+        gas_used = result["gas_used"][0]["gas_used"]
+
+    # Gap to milestone = GasLimit - Milestone
+    # Negative = OOG (not enough to reach milestone)
+    # Zero = exact boundary
+    # Positive = enough to reach milestone
+    gap = gas_limit - milestone
+
+    # Surplus = GasLimit - GasUsed (actual execution)
+    # Will be 0 (OOG) or positive (leftover gas)
+    surplus = (gas_limit - gas_used) if gas_used is not None else None
+
+    # Store data for aggregate reporting
+    _TEST_BAL_DELEGATECALL_NO_DELEGATION_GAS_DATA.append(
+        {
+            "test_name": test_name,
+            "boundary": oog_boundary.value,
+            "target": "W" if target_is_warm else "C",
+            "mem_expansion": ret_size,
+            "intrinsic": intrinsic_cost,
+            "bytecode": bytecode_cost,
+            "access": access_cost,
+            "mem_cost": memory_cost,
+            "static": static_gas_cost,
+            "milestone": milestone,
+            "gap": gap,
+            "gas_limit": gas_limit,
+            "gas_used": gas_used,
+            "surplus": surplus,
+            "tgt_bal": target_in_bal,
+        }
+    )
+
+
+def print_delegatecall_no_delegation_aggregate_table() -> None:
+    """Print aggregate gas table for DELEGATECALL (no delegation) test."""
+    if not _TEST_BAL_DELEGATECALL_NO_DELEGATION_GAS_DATA:
+        return
+
+    # Color coding function for gap (can be negative, zero, or positive)
+    def color_gap(value, row):
+        if value < 0:
+            return f"[red]{value}[/red]"
+        elif value == 0:
+            return f"[yellow]{value}[/yellow]"
+        else:
+            return f"[green]{value}[/green]"
+
+    # Color coding function for surplus (0 or positive only)
+    def color_surplus(value, row):
+        if value is None:
+            return "N/A"
+        elif value == 0:
+            return f"[yellow]{value}[/yellow]"
+        else:
+            return f"[green]{value}[/green]"
+
+    # Column definitions
+    columns = [
+        {"header": "Test Parameters", "key": "test_name", "style": "dim", "width": 40, "no_wrap": False},
+        {"header": "T", "key": "target", "justify": "center"},
+        {"header": "MemExp", "key": "mem_expansion", "justify": "right"},
+        {"header": "Intr (A)", "key": "intrinsic", "justify": "right"},
+        {"header": "Byte (B)", "key": "bytecode", "justify": "right"},
+        {"header": "Access (C)", "key": "access", "justify": "right"},
+        {"header": "Mem (D)", "key": "mem_cost", "justify": "right"},
+        {"header": "Static (E)", "key": "static", "justify": "right"},
+        {"header": "M", "key": "milestone", "justify": "right"},
+        {"header": "G", "key": "gap", "justify": "right", "color_fn": color_gap},
+        {"header": "GasLimit", "key": "gas_limit", "justify": "right"},
+        {"header": "GasUsed", "key": "gas_used", "justify": "right"},
+        {"header": "Surplus", "key": "surplus", "justify": "right", "color_fn": color_surplus},
+        {"header": "TgtBAL", "key": "tgt_bal", "justify": "center"},
+    ]
+
+    # Legend
+    legend = """
+[bold cyan]═══ MILESTONE CONCEPT ═══[/bold cyan]
+DELEGATECALL (no delegation) has one milestone:
+  [bold]M (Milestone)[/bold]: Gas needed to access target account
+     • If GasLimit ≥ M → Target appears in BAL
+     • OOG_BEFORE_TARGET_ACCESS: G < 0
+     • SUCCESS: G ≥ 0
+
+[bold]Legend:[/bold]
+  [bold]Test Parameters:[/bold]
+    T: Target warmness (W=warm, C=cold)
+    MemExp: Memory expansion size (0 or 32 bytes)
+
+  [bold]Gas Components:[/bold]
+    A: Intr - Intrinsic gas cost (base tx + access list)
+    B: Byte - Bytecode cost (6 × PUSH for DELEGATECALL params)
+    C: Access - Target access cost (cold=2600, warm=100)
+    D: Mem - Memory expansion cost
+    → E: Static - Static gas cost [C + D]
+
+  [bold]Milestone & Gap:[/bold]
+    → [cyan]M (Milestone) = A + B + E[/cyan] - Gas needed to access target
+    → [bold]G (Gap) = GasLimit - M[/bold]
+      • [red]G < 0[/red]: OOG - not enough gas to reach milestone
+      • [yellow]G = 0[/yellow]: Exact boundary
+      • [green]G > 0[/green]: Enough gas to reach milestone
+
+  [bold]Execution Results:[/bold]
+    GasLimit: Transaction gas limit (what we send)
+    GasUsed: Actual gas consumed by EVM execution
+    [bold]Surplus = GasLimit - GasUsed[/bold]
+      • [yellow]Surplus = 0[/yellow]: Out of gas (used all available)
+      • [green]Surplus > 0[/green]: Leftover gas (successful execution)
+
+  [bold]BAL Results:[/bold]
+    TgtBAL: Target account in BAL (True/False)
+"""
+
+    print_gas_table(
+        data=_TEST_BAL_DELEGATECALL_NO_DELEGATION_GAS_DATA,
+        columns=columns,
+        title="AGGREGATE GAS BREAKDOWN - test_bal_delegatecall_no_delegation_and_oog_before_target_access",
+        legend=legend,
+    )
 
 
 @pytest.mark.parametrize(
@@ -819,7 +1244,7 @@ def test_bal_call_7702_delegation_and_oog(
         post_state[target] = Account(balance=value if value_transferred else 0)
         post_state[caller] = Account(balance=0 if value_transferred else value)
 
-    blockchain_test(
+    test_instance = blockchain_test(
         pre=pre,
         blocks=[
             Block(
@@ -830,6 +1255,39 @@ def test_bal_call_7702_delegation_and_oog(
             )
         ],
         post=post_state,
+    )
+
+    # Track gas breakdown AFTER blockchain_test() executes
+    target_label = "warm_target" if target_is_warm else "cold_target"
+    delegation_label = (
+        "warm_delegation" if delegation_is_warm else "cold_delegation"
+    )
+    value_label = "with_value" if value > 0 else "no_value"
+    memory_label = "with_memory" if memory_expansion else "no_memory"
+    param_combo = f"{oog_boundary.value}, {target_label}, {delegation_label}, {value_label}, {memory_label}"
+
+    print_gas_breakdown(
+        test_name=param_combo,
+        oog_boundary=oog_boundary,
+        target_is_warm=target_is_warm,
+        delegation_is_warm=delegation_is_warm,
+        value=value,
+        memory_expansion=memory_expansion,
+        ret_size=ret_size,
+        message_gas=message_gas,
+        intrinsic_cost=intrinsic_cost,
+        bytecode_cost=bytecode_cost,
+        access_cost=access_cost,
+        transfer_cost=transfer_cost,
+        memory_cost=memory_cost,
+        delegation_cost=delegation_cost,
+        static_gas_cost=static_gas_cost,
+        second_check_cost=second_check_cost,
+        gas_limit=gas_limit,
+        target_in_bal=target_in_bal,
+        delegation_in_bal=delegation_in_bal,
+        value_transferred=value_transferred,
+        result=test_instance.get_result(),
     )
 
 
@@ -901,8 +1359,10 @@ def test_bal_delegatecall_no_delegation_and_oog_before_target_access(
 
     if oog_boundary == OutOfGasBoundary.OOG_BEFORE_TARGET_ACCESS:
         gas_limit = intrinsic_cost + bytecode_cost + static_gas_cost - 1
+        target_in_bal = False
     else:  # SUCCESS
         gas_limit = intrinsic_cost + bytecode_cost + static_gas_cost
+        target_in_bal = True
 
     tx = Transaction(
         sender=alice,
@@ -925,7 +1385,7 @@ def test_bal_delegatecall_no_delegation_and_oog_before_target_access(
             target: BalAccountExpectation.empty(),
         }
 
-    blockchain_test(
+    test_instance = blockchain_test(
         pre=pre,
         blocks=[
             Block(
@@ -936,6 +1396,27 @@ def test_bal_delegatecall_no_delegation_and_oog_before_target_access(
             )
         ],
         post={alice: Account(nonce=1)},
+    )
+
+    # Track gas breakdown AFTER blockchain_test() executes
+    target_label = "warm_target" if target_is_warm else "cold_target"
+    memory_label = "with_memory" if memory_expansion else "no_memory"
+    param_combo = f"{oog_boundary.value}, {target_label}, {memory_label}"
+
+    print_delegatecall_no_delegation_gas_breakdown(
+        test_name=param_combo,
+        oog_boundary=oog_boundary,
+        target_is_warm=target_is_warm,
+        memory_expansion=memory_expansion,
+        ret_size=ret_size,
+        intrinsic_cost=intrinsic_cost,
+        bytecode_cost=bytecode_cost,
+        access_cost=access_cost,
+        memory_cost=memory_cost,
+        static_gas_cost=static_gas_cost,
+        gas_limit=gas_limit,
+        target_in_bal=target_in_bal,
+        result=test_instance.get_result(),
     )
 
 
@@ -2970,3 +3451,11 @@ def test_bal_create_early_failure(
             would_be_contract_address: Account.NONEXISTENT,
         },
     )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def print_aggregate_at_end():
+    """Print aggregate gas tables at the end of test module."""
+    yield  # Let all tests run
+    print_aggregate_gas_table()
+    print_delegatecall_no_delegation_aggregate_table()
